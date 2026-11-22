@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cloud IR lab stack: SNS alerting, suspicious-API-call alerting, and two automated
+  remediation playbooks (public S3 exposure, world-open security groups).
+  Optionally deploys intentionally vulnerable resources. SANDBOX ACCOUNTS ONLY.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address subscribed to the alert topic (confirm the subscription).
+  AutoRemediate:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: "false = alert only (observe the vulnerable state); true = remediate automatically."
+  DeployVulnerableResources:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Create a publicly readable S3 bucket and an SSH-open-to-world security group for testing.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the vulnerable test security group.
+  SensitivePorts:
+    Type: CommaDelimitedList
+    Default: "22,23,3389,3306,5432,1433,6379,27017,9200"
+    Description: Ports that must never be open to 0.0.0.0/0 or ::/0.
+
+Conditions:
+  CreateVulnerable: !Equals [!Ref DeployVulnerableResources, "true"]
+
+Resources:
+  # ------------------------------------------------------------------ Alerting
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-security-alerts"
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ------------------------------------------------- Vulnerable test resources
+  VulnerableBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateVulnerable
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  VulnerableBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateVulnerable
+    Properties:
+      Bucket: !Ref VulnerableBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicRead
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${VulnerableBucket.Arn}/*"
+
+  VulnerableSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVulnerable
+    Properties:
+      GroupDescription: Intentionally vulnerable - SSH open to the world (lab only)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  # ------------------------------------------------------------- IAM (per function)
+  AlertFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: publish-alerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: "sns:Publish", Resource: !Ref AlertTopic}
+
+  S3RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: s3-remediation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPolicyStatus
+                  - s3:GetBucketAcl
+                  - s3:GetBucketTagging
+                Resource: "arn:aws:s3:::*"
+              - {Effect: Allow, Action: "sns:Publish", Resource: !Ref AlertTopic}
+
+  SgRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: sg-remediation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: "ec2:DescribeSecurityGroups", Resource: "*"}
+              - Effect: Allow
+                Action: ec2:RevokeSecurityGroupIngress
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+              - {Effect: Allow, Action: "sns:Publish", Resource: !Ref AlertTopic}
+
+  # ------------------------------------------------ Lambda 1: suspicious API alerting
+  AlertFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt AlertFunctionRole.Arn
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+
+          sns = boto3.client("sns")
+          TOPIC_ARN = os.environ["TOPIC_ARN"]
+
+          SEVERITY = {
+              "StopLogging": "CRITICAL", "DeleteTrail": "CRITICAL", "UpdateTrail": "HIGH",
+              "PutEventSelectors": "HIGH", "DeleteFlowLogs": "HIGH",
+              "StopConfigurationRecorder": "CRITICAL", "DeleteConfigurationRecorder": "CRITICAL",
+              "DeleteDetector": "CRITICAL", "DeactivateMFADevice": "HIGH",
+              "AttachUserPolicy": "HIGH", "AttachRolePolicy": "HIGH", "PutUserPolicy": "HIGH",
+              "CreateLoginProfile": "HIGH", "CreateAccessKey": "MEDIUM",
+          }
+
+
+          def handler(event, context):
+              detail = event["detail"]
+              name = detail["eventName"]
+              severity = SEVERITY.get(name, "MEDIUM")
+              identity = detail.get("userIdentity", {})
+              body = "\n".join([
+                  f"Severity : {severity}",
+                  f"API call : {detail['eventSource']} {name}",
+                  f"Actor    : {identity.get('arn', 'unknown')} ({identity.get('type', '?')})",
+                  f"Source IP: {detail.get('sourceIPAddress', '?')}",
+                  f"Region   : {detail.get('awsRegion', '?')}",
+                  f"Time     : {detail.get('eventTime', '?')}",
+                  f"Params   : {json.dumps(detail.get('requestParameters'), default=str)[:800]}",
+                  f"EventID  : {detail.get('eventID', '?')}",
+              ])
+              sns.publish(TopicArn=TOPIC_ARN, Subject=f"[{severity}] Suspicious API call: {name}"[:100], Message=body)
+
+  # ------------------------------------------------ Lambda 2: S3 public-exposure playbook
+  S3RemediationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt S3RemediationRole.Arn
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertTopic
+          AUTO_REMEDIATE: !Ref AutoRemediate
+      Code:
+        ZipFile: |
+          import os
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client("s3")
+          sns = boto3.client("sns")
+          TOPIC_ARN = os.environ["TOPIC_ARN"]
+          AUTO_REMEDIATE = os.environ["AUTO_REMEDIATE"].lower() == "true"
+          BLOCK_ALL = {
+              "BlockPublicAcls": True, "IgnorePublicAcls": True,
+              "BlockPublicPolicy": True, "RestrictPublicBuckets": True,
+          }
+
+
+          def get_block_config(bucket):
+              try:
+                  return s3.get_public_access_block(Bucket=bucket)["PublicAccessBlockConfiguration"]
+              except ClientError as err:
+                  if err.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration":
+                      return {}
+                  raise
+
+
+          def is_publicly_exposed(bucket):
+              """True if the bucket policy or ACL grants access to everyone."""
+              try:
+                  if s3.get_bucket_policy_status(Bucket=bucket)["PolicyStatus"]["IsPublic"]:
+                      return True
+              except ClientError as err:
+                  if err.response["Error"]["Code"] != "NoSuchBucketPolicy":
+                      raise
+              grants = s3.get_bucket_acl(Bucket=bucket)["Grants"]
+              return any(g["Grantee"].get("URI", "").endswith(("/AllUsers", "/AuthenticatedUsers")) for g in grants)
+
+
+          def is_allowlisted(bucket):
+              """Buckets tagged public-allowed=true (e.g. static websites) are skipped."""
+              try:
+                  tags = s3.get_bucket_tagging(Bucket=bucket)["TagSet"]
+              except ClientError:
+                  return False
+              return {"Key": "public-allowed", "Value": "true"} in tags
+
+
+          def handler(event, context):
+              detail = event["detail"]
+              bucket = detail["requestParameters"]["bucketName"]
+              actor = detail.get("userIdentity", {}).get("arn", "unknown")
+
+              # Idempotency: our own PutPublicAccessBlock call re-triggers this function.
+              config = get_block_config(bucket)
+              if all(config.get(key) for key in BLOCK_ALL) or is_allowlisted(bucket):
+                  return {"bucket": bucket, "result": "no action needed"}
+
+              exposed = is_publicly_exposed(bucket)
+              action = "NONE (AutoRemediate=false, alert only)"
+              if AUTO_REMEDIATE:
+                  s3.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration=BLOCK_ALL)
+                  action = "Enabled all four S3 Block Public Access settings (policy/ACL left intact for forensics)"
+
+              sns.publish(
+                  TopicArn=TOPIC_ARN,
+                  Subject=f"[HIGH] S3 exposure playbook: {bucket}"[:100],
+                  Message=(
+                      f"Bucket       : {bucket}\n"
+                      f"Trigger      : {detail['eventName']} by {actor}\n"
+                      f"Source IP    : {detail.get('sourceIPAddress', '?')}\n"
+                      f"Publicly open: {exposed}\n"
+                      f"Action taken : {action}\n"
+                      f"Next step    : follow runbook section 'Analysis' to scope data access."
+                  ),
+              )
+              return {"bucket": bucket, "exposed": exposed, "remediated": AUTO_REMEDIATE}
+
+  # ------------------------------------------------ Lambda 3: security group playbook
+  SgRemediationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt SgRemediationRole.Arn
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertTopic
+          AUTO_REMEDIATE: !Ref AutoRemediate
+          SENSITIVE_PORTS: !Join [",", !Ref SensitivePorts]
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+
+          ec2 = boto3.client("ec2")
+          sns = boto3.client("sns")
+          TOPIC_ARN = os.environ["TOPIC_ARN"]
+          AUTO_REMEDIATE = os.environ["AUTO_REMEDIATE"].lower() == "true"
+          SENSITIVE_PORTS = {int(p) for p in os.environ["SENSITIVE_PORTS"].split(",")}
+          WORLD_FIELDS = {"IpRanges": ("CidrIp", "0.0.0.0/0"), "Ipv6Ranges": ("CidrIpv6", "::/0")}
+
+
+          def exposes_sensitive_port(perm):
+              if perm["IpProtocol"] == "-1":
+                  return True  # all protocols and ports
+              low, high = perm.get("FromPort", 0), perm.get("ToPort", 65535)
+              return any(low <= port <= high for port in SENSITIVE_PORTS)
+
+
+          def find_offending_permissions(group):
+              """Return IpPermissions (world-open ranges only) that must be revoked."""
+              offending = []
+              for perm in group["IpPermissions"]:
+                  if not exposes_sensitive_port(perm):
+                      continue
+                  revoke = {"IpProtocol": perm["IpProtocol"]}
+                  if "FromPort" in perm:
+                      revoke.update(FromPort=perm["FromPort"], ToPort=perm["ToPort"])
+                  for key, (field, world) in WORLD_FIELDS.items():
+                      hits = [{field: r[field]} for r in perm.get(key, []) if r[field] == world]
+                      if hits:
+                          revoke[key] = hits
+                  if any(key in revoke for key in WORLD_FIELDS):
+                      offending.append(revoke)
+              return offending
+
+
+          def handler(event, context):
+              detail = event["detail"]
+              group_id = detail["requestParameters"]["groupId"]
+              actor = detail.get("userIdentity", {}).get("arn", "unknown")
+
+              group = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
+              offending = find_offending_permissions(group)
+              if not offending:
+                  return {"group": group_id, "result": "no action needed"}
+
+              action = "NONE (AutoRemediate=false, alert only)"
+              if AUTO_REMEDIATE:
+                  ec2.revoke_security_group_ingress(GroupId=group_id, IpPermissions=offending)
+                  action = "Revoked the rules below (re-create from this message if the change was legitimate)"
+
+              sns.publish(
+                  TopicArn=TOPIC_ARN,
+                  Subject=f"[HIGH] Security group playbook: {group_id}"[:100],
+                  Message=(
+                      f"Security group: {group_id} ({group.get('GroupName')})\n"
+                      f"Trigger       : {detail['eventName']} by {actor}\n"
+                      f"Source IP     : {detail.get('sourceIPAddress', '?')}\n"
+                      f"Action taken  : {action}\n"
+                      f"Rules         : {json.dumps(offending)}"
+                  ),
+              )
+              return {"group": group_id, "revoked": AUTO_REMEDIATE, "rules": offending}
+
+  # ---------------------------------------------------------- EventBridge rules
+  S3ExposureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: S3 changes that can expose a bucket
+      EventPattern:
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["s3.amazonaws.com"]
+          eventName:
+            - PutBucketPolicy
+            - PutBucketAcl
+            - PutBucketPublicAccessBlock
+            - DeleteBucketPublicAccessBlock
+          errorCode: [{exists: false}]
+      Targets:
+        - {Id: s3-playbook, Arn: !GetAtt S3RemediationFunction.Arn}
+
+  SgExposureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Security group ingress changes
+      EventPattern:
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["ec2.amazonaws.com"]
+          eventName: [AuthorizeSecurityGroupIngress, ModifySecurityGroupRules]
+          errorCode: [{exists: false}]
+      Targets:
+        - {Id: sg-playbook, Arn: !GetAtt SgRemediationFunction.Arn}
+
+  SuspiciousApiRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Audit-evasion and privilege-escalation API calls
+      EventPattern:
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventName:
+            - StopLogging
+            - DeleteTrail
+            - UpdateTrail
+            - PutEventSelectors
+            - DeleteFlowLogs
+            - StopConfigurationRecorder
+            - DeleteConfigurationRecorder
+            - DeleteDetector
+            - DeactivateMFADevice
+            - AttachUserPolicy
+            - AttachRolePolicy
+            - PutUserPolicy
+            - CreateLoginProfile
+            - CreateAccessKey
+          errorCode: [{exists: false}]
+      Targets:
+        - {Id: alert, Arn: !GetAtt AlertFunction.Arn}
+
+  S3RulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3RemediationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3ExposureRule.Arn
+
+  SgRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SgRemediationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SgExposureRule.Arn
+
+  AlertRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SuspiciousApiRule.Arn
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  VulnerableBucketName:
+    Condition: CreateVulnerable
+    Value: !Ref VulnerableBucket
+  VulnerableSecurityGroupId:
+    Condition: CreateVulnerable
+    Value: !Ref VulnerableSecurityGroup
